@@ -626,3 +626,177 @@ async def test_filtered_events_still_reach_dead_letters(client, receiver):
     assert statuses[1] == "dead"
     assert statuses[2] == "skipped"
     assert statuses[3] == "delivered"
+
+
+# ---------------------------------------------------------------- gap skips
+
+async def skip_gap(client, source, sequence, reason="manual skip"):
+    return await client.post(
+        f"/sources/{source}/gaps/{sequence}/skip", json={"reason": reason}
+    )
+
+
+async def test_gap_skip_releases_buffered_tail(client, receiver):
+    await subscribe(client)
+    await send_event(client, "orders", 1, "evt-1")
+    await send_event(client, "orders", 3, "evt-3")  # seq 2 never arrives
+
+    await wait_received(receiver, "orders", 1)
+    await asyncio.sleep(0.2)
+    assert delivered_sequences(receiver) == [1]  # 3 blocked behind the gap
+
+    r = await skip_gap(client, "orders", 2, "evt-2 lost upstream")
+    assert r.status_code == 201, r.text
+    marker = r.json()
+    assert marker["source"] == "orders"
+    assert marker["sequence"] == 2
+    assert marker["reason"] == "evt-2 lost upstream"
+    assert marker["created_at"]
+
+    # The watermark steps over the skipped gap and the buffered tail flows.
+    await wait_received(receiver, "orders", 3)
+    await wait_next_seq(client, "orders", 4)
+    assert delivered_sequences(receiver) == [1, 3]
+
+    # The gap is persisted as a skipped delivery for the subscription, and
+    # hidden from backlog / dead letters like any other skipped record.
+    assert (await delivery_statuses())[2] == "skipped"
+    assert (await client.get("/backlog")).json() == []
+    assert (await client.get("/dead-letters")).json() == []
+
+
+async def test_gap_skip_requires_missing_sequence_and_higher_sequence(client):
+    await subscribe(client)
+    # No events at all: no higher sequence exists for the source.
+    assert (await skip_gap(client, "orders", 1)).status_code == 409
+
+    await send_event(client, "orders", 1, "evt-1")
+    # Sequence 1 already has an event.
+    assert (await skip_gap(client, "orders", 1)).status_code == 409
+    # Sequence 5 is missing, but nothing higher exists either.
+    assert (await skip_gap(client, "orders", 5)).status_code == 409
+
+    await send_event(client, "orders", 3, "evt-3")
+    # Now 2 is a genuine gap with a higher sequence present.
+    assert (await skip_gap(client, "orders", 2)).status_code == 201
+
+
+async def test_gap_skip_idempotent_same_reason_conflict_on_different(client):
+    await subscribe(client)
+    await send_event(client, "orders", 1, "evt-1")
+    await send_event(client, "orders", 3, "evt-3")
+
+    r1 = await skip_gap(client, "orders", 2, "lost during failover")
+    assert r1.status_code == 201
+
+    # Same reason: idempotent, returns the original marker unchanged.
+    r2 = await skip_gap(client, "orders", 2, "lost during failover")
+    assert r2.status_code == 200
+    assert r2.json() == r1.json()
+
+    # Different reason: conflict, and the original marker is not overwritten.
+    r3 = await skip_gap(client, "orders", 2, "a different explanation")
+    assert r3.status_code == 409
+    r4 = await skip_gap(client, "orders", 2, "lost during failover")
+    assert r4.status_code == 200
+    assert r4.json()["reason"] == "lost during failover"
+    assert r4.json()["id"] == r1.json()["id"]
+
+
+async def test_gap_skip_requires_non_empty_reason(client):
+    await subscribe(client)
+    await send_event(client, "orders", 1, "evt-1")
+    await send_event(client, "orders", 3, "evt-3")
+
+    url = "/sources/orders/gaps/2/skip"
+    assert (await client.post(url, json={"reason": ""})).status_code == 422
+    assert (await client.post(url, json={"reason": "   "})).status_code == 422
+    assert (await client.post(url, json={})).status_code == 422
+
+
+async def test_event_at_skipped_sequence_rejected_no_resurrection(client, receiver):
+    await subscribe(client)
+    await send_event(client, "orders", 1, "evt-1")
+    await send_event(client, "orders", 3, "evt-3")
+    assert (await skip_gap(client, "orders", 2, "gone for good")).status_code == 201
+
+    # The late event for the skipped sequence is rejected and explains why.
+    r = await send_event(client, "orders", 2, "evt-2-late")
+    assert r.status_code == 409
+    assert "skipped" in r.json()["detail"].lower()
+    # Retrying does not resurrect the gap either.
+    assert (await send_event(client, "orders", 2, "evt-2-late")).status_code == 409
+
+    await wait_received(receiver, "orders", 3)
+    assert delivered_sequences(receiver) == [1, 3]
+    assert await delivery_statuses() == {
+        1: "delivered",
+        2: "skipped",
+        3: "delivered",
+    }
+
+
+async def test_gap_skip_does_not_overtake_retrying_head(client, receiver):
+    await subscribe(client)
+    receiver.fail_until["orders"] = 2  # head seq 1 fails its first 2 attempts
+
+    await send_event(client, "orders", 1, "evt-1")
+    await send_event(client, "orders", 3, "evt-3")
+    assert (await skip_gap(client, "orders", 2, "missing")).status_code == 201
+
+    await wait_received(receiver, "orders", 1)
+    await wait_received(receiver, "orders", 3)
+    await asyncio.sleep(0.2)
+
+    # The skipped gap at seq 2 must not let seq 3 jump ahead of the
+    # retrying head: attempts at seq 1 (fail, fail, ok), then seq 3.
+    assert [e["sequence"] for e in receiver.received] == [1, 1, 1, 3]
+    assert (await delivery_statuses())[2] == "skipped"
+    await wait_next_seq(client, "orders", 4)
+
+
+async def test_gap_skip_marks_all_current_subscriptions(client, receiver):
+    sub1 = await subscribe(client)
+    sub2 = await subscribe(client, url="http://receiver.local/hook2")
+    await send_event(client, "orders", 1, "evt-1")
+    await send_event(client, "orders", 3, "evt-3")
+
+    r = await skip_gap(client, "orders", 2, "gone")
+    assert r.status_code == 201
+
+    # Marker and per-subscription skipped rows commit together: both
+    # subscriptions already carry their skipped record for the gap.
+    async with app.state.db.execute(
+        """
+        SELECT d.subscription_id AS sub_id, d.status
+          FROM deliveries d
+          JOIN events e ON e.id = d.event_id
+         WHERE e.source = 'orders' AND e.sequence = 2
+        """
+    ) as cur:
+        rows = await cur.fetchall()
+    assert {row["sub_id"]: row["status"] for row in rows} == {
+        sub1["id"]: "skipped",
+        sub2["id"]: "skipped",
+    }
+
+    # Both watermarks step over the gap and both tails drain in order.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        subs = (await client.get("/subscriptions", params={"source": "orders"})).json()
+        if all(s["next_seq"] == 4 for s in subs):
+            break
+        await asyncio.sleep(0.02)
+    assert all(s["next_seq"] == 4 for s in subs)
+    assert (await client.get("/backlog")).json() == []
+
+
+async def test_new_subscription_after_gap_skip_starts_beyond(client, receiver):
+    await send_event(client, "orders", 1, "evt-1")  # no subscription yet
+    await send_event(client, "orders", 3, "evt-3")
+    assert (await skip_gap(client, "orders", 2, "gone")).status_code == 201
+
+    # The skipped sequence still occupies its slot: a new subscription
+    # starts beyond the highest known sequence, gap included.
+    sub = await subscribe(client)
+    assert sub["next_seq"] == 4

@@ -33,6 +33,15 @@ CREATE TABLE IF NOT EXISTS deliveries (
     UNIQUE(subscription_id, event_id)
 );
 
+CREATE TABLE IF NOT EXISTS gap_skips (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    source      TEXT NOT NULL,
+    sequence    INTEGER NOT NULL,
+    reason      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    UNIQUE(source, sequence)
+);
+
 CREATE INDEX IF NOT EXISTS idx_subscriptions_source ON subscriptions(source);
 CREATE INDEX IF NOT EXISTS idx_events_source_seq ON events(source, sequence);
 CREATE INDEX IF NOT EXISTS idx_deliveries_sub_status

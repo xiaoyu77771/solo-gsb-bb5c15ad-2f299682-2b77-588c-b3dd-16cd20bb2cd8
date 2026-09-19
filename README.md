@@ -6,6 +6,8 @@
 - 上报包含 `source`、单调递增 `sequence`、幂等键 `event_id` 的事件。
 - 服务对**每个订阅**严格按 `sequence` 顺序投递：乱序事件先缓冲，缺口补齐再发。
 - 不匹配 `filter` 的事件持久化为 `skipped`，水位线到达时原子越过，不留序号缺口。
+- 确认丢失的序号可写入带原因的持久化**跳过标记**（gap skip）：水位线到达时越过，
+  该序号之后禁止复活。
 - 重复 `event_id` 幂等返回，绝不重复投递。
 - 队头投递失败按指数退避重试，失败期间**后续事件不得越过**队头。
 - 重试次数耗尽后转入死信队列（Dead Letter），水位线越过该序号，后续序列继续投递。
@@ -185,6 +187,61 @@ curl -X POST http://localhost:8080/events -H 'Content-Type: application/json' \
 
 ---
 
+## 缺口跳过（gap skip）
+
+当某个序号的事件**确认永远不会到达**（上游丢失、故障切换期间数据损坏等），
+可以为该缺失序号写入持久化跳过标记，让各订阅的水位线合法越过它，而不是
+无限等待：
+
+```bash
+curl -X POST http://localhost:8080/sources/orders/gaps/7/skip \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"upstream lost evt-7 during failover"}'
+```
+
+```json
+{
+  "id": 1,
+  "source": "orders",
+  "sequence": 7,
+  "reason": "upstream lost evt-7 during failover",
+  "created_at": "2026-09-19T10:00:00.000000+00:00"
+}
+```
+
+规则：
+
+- `reason` 必须非空（空串、纯空白或缺失返回 `422`），随标记持久化，便于审计。
+- 仅当该序号**尚无事件**且同源**已存在更高序号**时才允许跳过，否则返回
+  `409`——防止把只是迟到的事件误判为丢失。
+- 幂等：同一 `(source, sequence)` 以**相同 reason** 重复调用返回 `200` 与
+  原标记；以**不同 reason** 调用返回 `409`，原标记不会被覆盖。
+- 标记与所有当前订阅的 `skipped` 投递记录在**同一事务**写入；worker 仅在
+  标记序号到达某订阅的 `next_seq` 时才推进其水位线，绝不越过正在重试的队头。
+- 标记不可逆：之后上报同源同序号的事件返回 `409` 并说明该序号已跳过，
+  缺口不会复活。
+- 跳过记录与 `filter` 产生的 `skipped` 一样，不出现在 `/backlog` 与
+  `/dead-letters`；跳过之后注册的新订阅从当前最大序号之后开始，自然越过缺口。
+
+示例：序号 2 丢失、3 已缓冲时，跳过 2 后 3 立即按序投递：
+
+```bash
+curl -X POST http://localhost:8080/events -H 'Content-Type: application/json' \
+  -d '{"source":"orders","sequence":1,"event_id":"e1"}'
+curl -X POST http://localhost:8080/events -H 'Content-Type: application/json' \
+  -d '{"source":"orders","sequence":3,"event_id":"e3"}'   # 缓冲，等待 2
+
+curl -X POST http://localhost:8080/sources/orders/gaps/2/skip \
+  -H 'Content-Type: application/json' -d '{"reason":"evt-2 lost upstream"}'
+# -> 201；水位线越过 2，事件 3 随即投递
+
+curl -X POST http://localhost:8080/events -H 'Content-Type: application/json' \
+  -d '{"source":"orders","sequence":2,"event_id":"e2-late"}'
+# -> 409：sequence 2 ... was permanently skipped (reason: evt-2 lost upstream)
+```
+
+---
+
 ## 投递、重试与死信语义
 
 每个订阅维护一个投递水位线 `next_seq`：
@@ -248,6 +305,7 @@ curl -X POST http://localhost:8080/dead-letters/replay \
 | GET  | `/subscriptions?source=` | 列出订阅（含 `filter`） |
 | DELETE | `/subscriptions/{id}` | 删除订阅（级联删除其投递记录） |
 | POST | `/events` | 上报事件 `{source, sequence, event_id, payload}` |
+| POST | `/sources/{source}/gaps/{sequence}/skip` | 为缺失序号写入持久化跳过标记 `{reason}` |
 | GET  | `/backlog?source=&subscription_id=&limit=` | 在途/缓冲积压 |
 | GET  | `/dead-letters?source=&subscription_id=&limit=` | 死信列表 |
 | POST | `/dead-letters/{id}/replay` | 重放单条死信 |
@@ -310,4 +368,6 @@ pytest -q
 测试覆盖：乱序缓冲与顺序投递、缺口阻塞、event_id 幂等、序号冲突 409、
 失败退避不越序、重试耗尽入死信后尾部继续、死信单条/批量重放、按 source 隔离、
 过滤器校验（未知操作符/空组合/嵌套上限）、过滤跳过与水位线推进、
-skipped 不越过重试中的队头、skipped 不出现在积压与死信接口。
+skipped 不越过重试中的队头、skipped 不出现在积压与死信接口、
+缺口跳过（前置条件 409、同因幂等/异因 409、空 reason 422、跳过序号禁止复活、
+多订阅同事务标记、水位线不越过重试队头、跳过记录不进积压与死信）。

@@ -47,6 +47,26 @@ class EventAck(BaseModel):
     status: str
 
 
+class GapSkipIn(BaseModel):
+    # Audit trail for why the sequence was abandoned; blank is meaningless.
+    reason: str = Field(min_length=1, max_length=1024)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must be a non-empty, non-blank string")
+        return value
+
+
+class GapSkipOut(BaseModel):
+    id: int
+    source: str
+    sequence: int
+    reason: str
+    created_at: str
+
+
 class DeliveryOut(BaseModel):
     id: int
     subscription_id: int
