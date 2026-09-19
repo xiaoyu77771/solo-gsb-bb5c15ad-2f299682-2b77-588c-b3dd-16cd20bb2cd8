@@ -626,3 +626,209 @@ async def test_filtered_events_still_reach_dead_letters(client, receiver):
     assert statuses[1] == "dead"
     assert statuses[2] == "skipped"
     assert statuses[3] == "delivered"
+
+
+# ------------------------------------------------------------------ gap skips
+
+async def skip_gap(client, source, sequence, reason="producer lost the event"):
+    return await client.post(
+        f"/sources/{source}/gaps/{sequence}/skip", json={"reason": reason}
+    )
+
+
+async def test_gap_skip_advances_watermark_and_delivers_tail(client, receiver):
+    await subscribe(client)
+    await send_event(client, "orders", 1, "evt-1")
+    await send_event(client, "orders", 3, "evt-3")
+
+    await wait_received(receiver, "orders", 1)
+    # The gap at 2 holds the tail back.
+    await asyncio.sleep(0.2)
+    assert delivered_sequences(receiver) == [1]
+    assert [b["sequence"] for b in (await client.get("/backlog")).json()] == [3]
+
+    r = await skip_gap(client, "orders", 2, "producer lost evt-0002")
+    assert r.status_code == 201, r.text
+    marker = r.json()
+    assert marker["source"] == "orders"
+    assert marker["sequence"] == 2
+    assert marker["reason"] == "producer lost evt-0002"
+    assert marker["duplicate"] is False
+    assert marker["id"] >= 1
+    assert marker["created_at"]
+
+    # The worker steps the watermark over the marker and releases seq 3.
+    await wait_received(receiver, "orders", 3)
+    sub = await wait_next_seq(client, "orders", 4)
+    assert sub["cursor_seq"] == 3
+    assert delivered_sequences(receiver) == [1, 3]
+
+    # The marker persists as a skipped delivery, hidden from backlog and
+    # dead letters.
+    assert await delivery_statuses() == {
+        1: "delivered",
+        2: "skipped",
+        3: "delivered",
+    }
+    assert (await client.get("/backlog")).json() == []
+    assert (await client.get("/dead-letters")).json() == []
+
+
+async def test_gap_skip_rejects_sequence_that_already_has_an_event(client):
+    await subscribe(client)
+    await send_event(client, "orders", 1, "evt-1")
+    r = await skip_gap(client, "orders", 1)
+    assert r.status_code == 409
+    assert "already has an event" in r.json()["detail"]
+
+
+async def test_gap_skip_requires_a_higher_sequence(client):
+    await subscribe(client)
+    # Unknown source: nothing can be "missing" yet.
+    assert (await skip_gap(client, "orders", 1)).status_code == 409
+
+    await send_event(client, "orders", 1, "evt-1")
+    await send_event(client, "orders", 2, "evt-2")
+    # 3 is the live tail, not a gap: it may still arrive.
+    r = await skip_gap(client, "orders", 3)
+    assert r.status_code == 409
+    assert "no event above sequence" in r.json()["detail"]
+
+
+async def test_gap_skip_idempotent_same_reason_immutable_marker(client):
+    await subscribe(client)
+    await send_event(client, "orders", 1, "evt-1")
+    await send_event(client, "orders", 3, "evt-3")
+
+    r1 = await skip_gap(client, "orders", 2, "lost in deploy")
+    assert r1.status_code == 201
+    first = r1.json()
+
+    # Same reason: idempotent replay returns the original marker.
+    r2 = await skip_gap(client, "orders", 2, "lost in deploy")
+    assert r2.status_code == 200
+    second = r2.json()
+    assert second["id"] == first["id"]
+    assert second["created_at"] == first["created_at"]
+    assert second["reason"] == "lost in deploy"
+    assert second["duplicate"] is True
+
+    # A different reason must not overwrite the marker.
+    r3 = await skip_gap(client, "orders", 2, "a different explanation")
+    assert r3.status_code == 409
+    assert "immutable" in r3.json()["detail"]
+
+    # The stored marker is unchanged.
+    r4 = await skip_gap(client, "orders", 2, "lost in deploy")
+    assert r4.status_code == 200
+    assert r4.json()["reason"] == "lost in deploy"
+
+
+async def test_ingest_after_gap_skip_conflicts_no_resurrection(client, receiver):
+    await subscribe(client)
+    await send_event(client, "orders", 1, "evt-1")
+    await send_event(client, "orders", 3, "evt-3")
+    await wait_received(receiver, "orders", 1)
+
+    assert (await skip_gap(client, "orders", 2, "gone for good")).status_code == 201
+
+    # Same source+sequence can never be ingested again, whatever event_id.
+    r = await send_event(client, "orders", 2, "evt-2")
+    assert r.status_code == 409
+    assert "skipped" in r.json()["detail"]
+    assert "gone for good" in r.json()["detail"]
+    r = await send_event(client, "orders", 2, "evt-2-retry")
+    assert r.status_code == 409
+
+    # The tail still flows and nothing at seq 2 is ever delivered.
+    await wait_received(receiver, "orders", 3)
+    assert delivered_sequences(receiver) == [1, 3]
+
+
+async def test_gap_skip_without_subscriptions_still_blocks_ingest(client):
+    await send_event(client, "orders", 1, "evt-1")
+    await send_event(client, "orders", 3, "evt-3")
+    r = await skip_gap(client, "orders", 2, "no subscribers yet")
+    assert r.status_code == 201
+    assert (await send_event(client, "orders", 2, "evt-2")).status_code == 409
+
+
+async def test_gap_skip_waits_for_retrying_head(client, receiver):
+    await subscribe(client)
+    receiver.fail_until["orders"] = 2  # head fails twice, then succeeds
+
+    await send_event(client, "orders", 1, "evt-1")
+    await send_event(client, "orders", 3, "evt-3")
+
+    # Mark the gap while the head is still retrying.
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if any(e["sequence"] == 1 for e in receiver.received):
+            break
+        await asyncio.sleep(0.02)
+    assert (await skip_gap(client, "orders", 2, "lost")).status_code == 201
+
+    await wait_received(receiver, "orders", 1)
+    await wait_received(receiver, "orders", 3)
+    await asyncio.sleep(0.2)
+
+    # Physical order: only attempts at seq 1, then 3. The marker at 2 must
+    # not let the tail jump ahead of the retrying head.
+    assert [e["sequence"] for e in receiver.received] == [1, 1, 1, 3]
+    await wait_next_seq(client, "orders", 4)
+    assert await delivery_statuses() == {
+        1: "delivered",
+        2: "skipped",
+        3: "delivered",
+    }
+
+
+async def test_gap_skip_fans_out_to_all_current_subscriptions(client, receiver):
+    sub_a = await subscribe(client, source="multi")
+    sub_b = await subscribe(client, source="multi", url=RECEIVER_URL + "?sub=b")
+
+    await send_event(client, "multi", 1, "m-1")
+    await send_event(client, "multi", 3, "m-3")
+    await wait_received(receiver, "multi", 1)
+
+    assert (await skip_gap(client, "multi", 2, "lost")).status_code == 201
+
+    # Both subscriptions step over the gap and receive the tail.
+    await wait_received(receiver, "multi", 3)
+    deadline = time.monotonic() + 5
+    subs = []
+    while time.monotonic() < deadline:
+        subs = (await client.get("/subscriptions", params={"source": "multi"})).json()
+        if len(subs) == 2 and all(s["next_seq"] == 4 for s in subs):
+            break
+        await asyncio.sleep(0.02)
+    assert {s["id"] for s in subs} == {sub_a["id"], sub_b["id"]}
+    assert all(s["next_seq"] == 4 for s in subs)
+
+    # One persisted skipped delivery per subscription for the marked gap.
+    async with app.state.db.execute(
+        """
+        SELECT COUNT(*) AS n
+          FROM deliveries d
+          JOIN events e ON e.id = d.event_id
+         WHERE e.source = 'multi' AND e.sequence = 2 AND d.status = 'skipped'
+        """
+    ) as cur:
+        assert (await cur.fetchone())["n"] == 2
+
+
+async def test_gap_skip_reason_must_be_non_blank(client):
+    await subscribe(client)
+    await send_event(client, "orders", 1, "evt-1")
+    await send_event(client, "orders", 3, "evt-3")
+
+    for bad in ("", "   "):
+        r = await client.post(
+            "/sources/orders/gaps/2/skip", json={"reason": bad}
+        )
+        assert r.status_code == 422
+    r = await client.post("/sources/orders/gaps/2/skip", json={})
+    assert r.status_code == 422
+    # Path validation: sequence must be >= 1.
+    r = await client.post("/sources/orders/gaps/0/skip", json={"reason": "x"})
+    assert r.status_code == 422

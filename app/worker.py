@@ -37,7 +37,9 @@ class DeliveryWorker:
     ``skipped``. A skipped event still occupies its sequence number, so once
     it becomes the head (sequence == next_seq) the watermark steps over it
     atomically — never earlier, so a retrying predecessor is never jumped
-    and filtered sequences leave no permanent gap.
+    and filtered sequences leave no permanent gap. Permanently skipped gaps
+    (POST /sources/{source}/gaps/{sequence}/skip) persist the same kind of
+    ``skipped`` delivery row and follow exactly this path.
     """
 
     def __init__(self, db: aiosqlite.Connection) -> None:

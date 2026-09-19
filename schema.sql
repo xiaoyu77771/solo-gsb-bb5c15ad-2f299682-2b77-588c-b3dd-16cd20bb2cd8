@@ -20,6 +20,15 @@ CREATE TABLE IF NOT EXISTS events (
     UNIQUE(source, sequence)
 );
 
+CREATE TABLE IF NOT EXISTS gap_skips (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    source      TEXT NOT NULL,
+    sequence    INTEGER NOT NULL,
+    reason      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    UNIQUE(source, sequence)
+);
+
 CREATE TABLE IF NOT EXISTS deliveries (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,

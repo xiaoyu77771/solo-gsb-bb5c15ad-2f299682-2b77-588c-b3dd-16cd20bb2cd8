@@ -4,7 +4,7 @@ import json
 from contextlib import asynccontextmanager
 
 import aiosqlite
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request, Response
 
 from .database import init_db, tx, utcnow_iso
 from .filtering import matches as filter_matches
@@ -12,6 +12,8 @@ from .models import (
     DeliveryOut,
     EventAck,
     EventIn,
+    GapSkipIn,
+    GapSkipOut,
     ReplayBulkBody,
     ReplayResult,
     SubscriptionIn,
@@ -70,6 +72,7 @@ async def root() -> dict:
             "GET    /subscriptions",
             "DELETE /subscriptions/{id}",
             "POST   /events",
+            "POST   /sources/{source}/gaps/{sequence}/skip",
             "GET    /backlog",
             "GET    /dead-letters",
             "POST   /dead-letters/{id}/replay",
@@ -196,6 +199,23 @@ async def ingest_event(
     # Idempotency first: same (source, event_id) always returns the same ack,
     # regardless of whether the original POST finished ingesting rows.
     async with tx(conn):
+        # A permanently skipped gap can never be filled: reject the event
+        # instead of resurrecting the sequence.
+        async with conn.execute(
+            "SELECT reason FROM gap_skips WHERE source = ? AND sequence = ?",
+            (body.source, body.sequence),
+        ) as cur:
+            gap = await cur.fetchone()
+        if gap is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"sequence {body.sequence} for source {body.source!r} was "
+                    f"permanently skipped (reason: {gap['reason']}); skipped "
+                    "sequences cannot be ingested"
+                ),
+            )
+
         async with conn.execute(
             "SELECT id FROM events WHERE source = ? AND event_id = ?",
             (body.source, body.event_id),
@@ -267,6 +287,140 @@ async def ingest_event(
         duplicate=duplicate,
         queued=queued,
         status="accepted",
+    )
+
+
+# -------------------------------------------------------------------- gaps
+
+@app.post(
+    "/sources/{source}/gaps/{sequence}/skip",
+    response_model=GapSkipOut,
+    tags=["gaps"],
+)
+async def skip_gap(
+    body: GapSkipIn,
+    response: Response,
+    source: str = Path(min_length=1, max_length=256),
+    sequence: int = Path(ge=1),
+    conn: aiosqlite.Connection = Depends(db),
+    delivery_worker: DeliveryWorker = Depends(worker),
+) -> GapSkipOut:
+    """Permanently skip a missing sequence so queued successors can flow.
+
+    Allowed only while the sequence has no event and a higher sequence is
+    already known for the source (i.e. it is a real gap, not the live tail).
+    The marker and a ``skipped`` delivery row for every current subscription
+    of the source are written in one transaction; the worker then steps each
+    watermark over the gap once it becomes the head. Markers are immutable:
+    the same reason replays idempotently, a different one conflicts.
+    """
+    async with tx(conn):
+        async with conn.execute(
+            "SELECT id, reason, created_at FROM gap_skips "
+            "WHERE source = ? AND sequence = ?",
+            (source, sequence),
+        ) as cur:
+            existing = await cur.fetchone()
+
+        if existing is not None:
+            if existing["reason"] != body.reason:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"sequence {sequence} for source {source!r} is already "
+                        "skipped with a different reason; skip markers are "
+                        "immutable"
+                    ),
+                )
+            response.status_code = 200
+            return GapSkipOut(
+                id=existing["id"],
+                source=source,
+                sequence=sequence,
+                reason=existing["reason"],
+                created_at=existing["created_at"],
+                duplicate=True,
+            )
+
+        async with conn.execute(
+            "SELECT 1 FROM events WHERE source = ? AND sequence = ?",
+            (source, sequence),
+        ) as cur:
+            event_present = await cur.fetchone() is not None
+        if event_present:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"sequence {sequence} for source {source!r} already has "
+                    "an event; only missing sequences can be skipped"
+                ),
+            )
+
+        async with conn.execute(
+            "SELECT 1 FROM events WHERE source = ? AND sequence > ? LIMIT 1",
+            (source, sequence),
+        ) as cur:
+            higher_present = await cur.fetchone() is not None
+        if not higher_present:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"source {source!r} has no event above sequence "
+                    f"{sequence}; the gap may still fill, refusing to skip"
+                ),
+            )
+
+        now = utcnow_iso()
+        # Placeholder event so the gap occupies its (source, sequence) slot
+        # and per-subscription delivery rows can reference it. Its reserved
+        # event_id can never collide with a client-supplied one because the
+        # gap check above rejects any ingest at this sequence.
+        cur = await conn.execute(
+            """
+            INSERT INTO events (source, sequence, event_id, payload, created_at)
+            VALUES (?, ?, ?, NULL, ?)
+            """,
+            (source, sequence, f"__gap_skip__:{sequence}", now),
+        )
+        event_pk = cur.lastrowid
+
+        cur = await conn.execute(
+            """
+            INSERT INTO gap_skips (source, sequence, reason, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (source, sequence, body.reason, now),
+        )
+        skip_id = cur.lastrowid
+
+        # Fan out a persisted 'skipped' record to every current subscription
+        # of the source, in the same transaction as the marker. The worker
+        # steps a watermark over such a row only once it sits exactly at
+        # next_seq, so a retrying head is never jumped.
+        async with conn.execute(
+            "SELECT id FROM subscriptions WHERE source = ?", (source,)
+        ) as cur:
+            sub_ids = [row["id"] for row in await cur.fetchall()]
+        for sub_id in sub_ids:
+            await conn.execute(
+                """
+                INSERT INTO deliveries
+                    (subscription_id, event_id, status, attempts,
+                     next_attempt_at, last_error, created_at, updated_at)
+                VALUES (?, ?, 'skipped', 0, NULL, NULL, ?, ?)
+                """,
+                (sub_id, event_pk, now, now),
+            )
+
+    delivery_worker.wake()
+    response.status_code = 201
+    return GapSkipOut(
+        id=skip_id,
+        source=source,
+        sequence=sequence,
+        reason=body.reason,
+        created_at=now,
+        duplicate=False,
     )
 
 

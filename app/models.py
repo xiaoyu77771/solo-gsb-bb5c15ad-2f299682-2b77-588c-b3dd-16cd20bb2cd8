@@ -68,3 +68,25 @@ class ReplayResult(BaseModel):
 
 class ReplayBulkBody(BaseModel):
     delivery_ids: list[int] = Field(default_factory=list, max_length=1000)
+
+
+class GapSkipIn(BaseModel):
+    # Non-empty (and non-blank) justification, persisted with the marker.
+    reason: str = Field(min_length=1, max_length=1000)
+
+    @field_validator("reason")
+    @classmethod
+    def _non_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must be non-empty")
+        return value
+
+
+class GapSkipOut(BaseModel):
+    id: int
+    source: str
+    sequence: int
+    reason: str
+    created_at: str
+    # True when an identical marker already existed (idempotent replay).
+    duplicate: bool
